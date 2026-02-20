@@ -1,0 +1,328 @@
+//@version=6
+strategy(
+     "Custom BB STRATEGY (LTF 5m + HTF 1H) — Entry Logic",
+     overlay=true,
+     max_lines_count=500,
+     max_labels_count=500,
+     pyramiding=0,
+     process_orders_on_close=true,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1
+)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Inputs
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+len     = input.int(20, "Length", minval=1)
+mult    = input.float(2.0, "StdDev Mult", minval=0.0, step=0.1)
+
+showLongBands    = input.bool(true,  "Show LTF Long Bands (High-based)")
+showShortBands   = input.bool(true,  "Show LTF Short Bands (Low-based)")
+showHTF          = input.bool(true,  "Show HTF Bands (1H Close-based)")
+htfTf            = input.timeframe("60", "HTF Timeframe")
+
+xLookback        = input.int(20, "HTF Breakout Lookback (x bars)", minval=1)
+showStateSignals = input.bool(true, "Show HTF State Signals (LBO/SBO/MEAN)")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Entry logic inputs
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+enableEntryLogic  = input.bool(true, "Enable Entry Logic")
+rangeStartBarsAgo = input.int(12,  "Breakout Range Start (bars ago)", minval=1)
+rangeEndBarsAgo   = input.int(240, "Breakout Range End (bars ago)",   minval=2)
+meanWin           = input.int(12,  "Mean Filter Window (bars)",       minval=1)
+
+rrBreakout        = input.float(2.0, "RR Breakout", minval=0.1, step=0.1)
+rrMean            = input.float(3.0, "RR Mean",     minval=0.1, step=0.1)
+
+riskPct           = input.float(0.1, "Risk per trade (%)", minval=0.001, step=0.01)
+
+showEntrySignals  = input.bool(true, "Show Entry Signals")
+showTradeLevels   = input.bool(true, "Show Projected SL/TP Lines (last signal)")
+showEntryLabel    = input.bool(false, "Show SL/TP Label (last signal)")
+
+// Optional: visual warning if chart isn't 5m
+is5m = timeframe.isminutes and timeframe.multiplier == 5
+var label tfWarn = na
+if barstate.islast
+    if not is5m
+        string msg = "⚠️ Designed for LTF = 5 minutes.\n(You are on: " + timeframe.period + ")"
+        if na(tfWarn)
+            tfWarn := label.new(bar_index, high, msg, style=label.style_label_down, textcolor=color.white, color=color.new(color.orange, 0))
+        else
+            label.set_xy(tfWarn, bar_index, high)
+            label.set_text(tfWarn, msg)
+    else
+        if not na(tfWarn)
+            label.delete(tfWarn)
+            tfWarn := na
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LTF (5m) — LONG (High-based) variants
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bhe  = ta.ema(high, len)
+bheD = ta.stdev(high, len) * mult
+bheU = bhe + bheD
+bheL = bhe - bheD
+
+bhw  = ta.wma(high, len)
+bhwD = ta.stdev(high, len) * mult
+bhwU = bhw + bhwD
+bhwL = bhw - bhwD
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LTF (5m) — SHORT (Low-based) variants
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ble  = ta.ema(low, len)
+bleD = ta.stdev(low, len) * mult
+bleU = ble + bleD
+bleL = ble - bleD
+
+blw  = ta.wma(low, len)
+blwD = ta.stdev(low, len) * mult
+blwU = blw + blwD
+blwL = blw - blwD
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HTF (1H) — BB on CLOSE (SMA, SD) + STATE (LBO/SBO/MEAN)
+// No repaint: lookahead_off means LTF sees LAST CLOSED HTF candle.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[bcs, bcsStdev, lboRaw, sboRaw] = request.security(
+    syminfo.tickerid,
+    htfTf,
+    [
+        ta.sma(close, len),
+        ta.stdev(close, len),
+        ta.lowest(close - ta.sma(close, len), xLookback) > 0,
+        ta.highest(close - ta.sma(close, len), xLookback) < 0
+    ],
+    lookahead=barmerge.lookahead_off
+)
+
+bcsU = bcs + (bcsStdev * mult)
+bcsL = bcs - (bcsStdev * mult)
+
+lbo  = (lboRaw == true)
+sbo  = (sboRaw == true)
+mean = not lbo and not sbo
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Plots (same visuals as indicator)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+pBHE  = plot(showLongBands ? bhe  : na, "BHE (EMA basis, High)",  color=color.new(color.lime, 0), linewidth=2)
+pBHEU = plot(showLongBands ? bheU : na, "BHEU",                  color=color.new(color.lime, 0), linewidth=1)
+pBHEL = plot(showLongBands ? bheL : na, "BHEL",                  color=color.new(color.lime, 0), linewidth=1)
+
+pBHW  = plot(showLongBands ? bhw  : na, "BHW (WMA basis, High)",  color=color.new(color.teal, 0), linewidth=2)
+pBHWU = plot(showLongBands ? bhwU : na, "BHWU",                  color=color.new(color.teal, 0), linewidth=1)
+pBHWL = plot(showLongBands ? bhwL : na, "BHWL",                  color=color.new(color.teal, 0), linewidth=1)
+
+fill(pBHEU, pBHWU, title="Long Fill (Upper)", color=color.new(color.lime, 85))
+fill(pBHEL, pBHWL, title="Long Fill (Lower)", color=color.new(color.lime, 85))
+
+pBLE  = plot(showShortBands ? ble  : na, "BLE (EMA basis, Low)",  color=color.new(color.red, 0), linewidth=2)
+pBLEU = plot(showShortBands ? bleU : na, "BLEU",                 color=color.new(color.red, 0), linewidth=1)
+pBLEL = plot(showShortBands ? bleL : na, "BLEL",                 color=color.new(color.red, 0), linewidth=1)
+
+pBLW  = plot(showShortBands ? blw  : na, "BLW (WMA basis, Low)",  color=color.new(color.maroon, 0), linewidth=2)
+pBLWU = plot(showShortBands ? blwU : na, "BLWU",                 color=color.new(color.maroon, 0), linewidth=1)
+pBLWL = plot(showShortBands ? blwL : na, "BLWL",                 color=color.new(color.maroon, 0), linewidth=1)
+
+fill(pBLEU, pBLWU, title="Short Fill (Upper)", color=color.new(color.red, 85))
+fill(pBLEL, pBLWL, title="Short Fill (Lower)", color=color.new(color.red, 85))
+
+darkBlue = color.new(color.navy, 0)
+plot(showHTF ? bcs  : na, "BCS (HTF SMA basis, Close)", color=darkBlue, linewidth=3)
+plot(showHTF ? bcsU : na, "BCSU",                      color=darkBlue, linewidth=1)
+plot(showHTF ? bcsL : na, "BCSL",                      color=darkBlue, linewidth=1)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HTF STATE SIGNALS (LBO / SBO / MEAN)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+isNewHTF = timeframe.change(htfTf)
+
+int currState = lbo ? 1 : sbo ? -1 : 0
+var int lastState = na
+bool stateChanged = isNewHTF and (na(lastState) or currState != lastState)
+
+if isNewHTF
+    lastState := currState
+
+plotshape(showStateSignals and stateChanged and currState == 1,
+     title="LBO State Change",
+     style=shape.labelup, location=location.abovebar,
+     text="LBO", color=color.new(color.lime, 0), textcolor=color.white, size=size.tiny)
+
+plotshape(showStateSignals and stateChanged and currState == -1,
+     title="SBO State Change",
+     style=shape.labelup, location=location.abovebar,
+     text="SBO", color=color.new(color.red, 0), textcolor=color.white, size=size.tiny)
+
+plotshape(showStateSignals and stateChanged and currState == 0,
+     title="MEAN State Change",
+     style=shape.labelup, location=location.abovebar,
+     text="MEAN", color=color.new(color.gray, 0), textcolor=color.white, size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ✅ ENTRY LOGIC (exactly per your rules)
+// h[0] = current bar, h[1] = previous bar (LTF)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+int startA   = math.min(rangeStartBarsAgo, rangeEndBarsAgo)
+int endA     = math.max(rangeStartBarsAgo, rangeEndBarsAgo)
+int rangeLen = endA - startA + 1
+
+float rangeHigh = ta.highest(high[startA], rangeLen) // barsAgo startA..endA
+float rangeLow  = ta.lowest(low[startA],  rangeLen)
+
+float minLongUpperPrev   = math.min(bheU[1], bhwU[1])   // min(BHEU[1], BHWU[1])
+float maxShortLowerPrev  = math.max(bleL[1], blwL[1])   // max(BLEL[1], BLWL[1])
+
+float meanLongTopPrev = math.max(bheL[1], bhwL[1])      // max(BHEL[1], BHWL[1])
+float meanLongBotPrev = math.min(bheL[1], bhwL[1])      // min(BHEL[1], BHWL[1])
+
+float meanShortBotPrev = math.min(bleU[1], blwU[1])     // min(BLEU[1], BLWU[1])
+float meanShortTopPrev = math.max(bleU[1], blwU[1])     // max(BLEU[1], BLWU[1])
+
+float lowestToPrev  = ta.lowest(low[1],  meanWin)       // lowest of last meanWin bars ending at h[1]
+float highestToPrev = ta.highest(high[1], meanWin)      // highest of last meanWin bars ending at h[1]
+
+// Breakout entries
+bool sigLongBreakout =
+     enableEntryLogic and lbo and
+     (close[1] > minLongUpperPrev) and
+     (close > rangeHigh)
+
+bool sigShortBreakout =
+     enableEntryLogic and sbo and
+     (close[1] < maxShortLowerPrev) and
+     (close < rangeLow)
+
+// Mean entries
+bool sigLongMean =
+     enableEntryLogic and mean and
+     (low[1] < meanLongTopPrev) and (low[1] > meanLongBotPrev) and
+     (close[1] > meanLongTopPrev) and
+     (lowestToPrev < bcsL[1]) and (close[1] > bcsL[1])
+
+bool sigShortMean =
+     enableEntryLogic and mean and
+     (high[1] > meanShortBotPrev) and (high[1] < meanShortTopPrev) and
+     (close[1] < meanShortBotPrev) and
+     (highestToPrev > bcsU) and (close[1] < bcsU[1])
+
+// Visual entry markers
+plotshape(showEntrySignals and sigLongBreakout,  title="Entry Long Breakout (LBO)",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0),   text="LBO",  textcolor=color.white, size=size.tiny)
+plotshape(showEntrySignals and sigShortBreakout, title="Entry Short Breakout (SBO)", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),    text="SBO",  textcolor=color.white, size=size.tiny)
+plotshape(showEntrySignals and sigLongMean,      title="Entry Long Mean",            style=shape.circle,       location=location.belowbar, color=color.new(color.teal, 0),   text="M-L",  textcolor=color.white, size=size.tiny)
+plotshape(showEntrySignals and sigShortMean,     title="Entry Short Mean",           style=shape.circle,       location=location.abovebar, color=color.new(color.maroon, 0), text="M-S",  textcolor=color.white, size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Risk-based position sizing (0.1% equity per trade)
+// qty = riskCash / (abs(entry-stop) * pointvalue)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+f_pointValue() =>
+    syminfo.pointvalue == 0.0 ? 1.0 : syminfo.pointvalue
+
+f_qtyRisk(float entry, float stop) =>
+    float pv = f_pointValue()
+    float dist = math.abs(entry - stop)
+    float riskCash = strategy.equity * (riskPct / 100.0)
+    dist > 0 and pv > 0 ? (riskCash / (dist * pv)) : na
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Trade construction (priority: Breakout first, then Mean)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+int tradeType = 0        // 0 none, 1 LBO-BO, 2 SBO-BO, 3 MEAN-L, 4 MEAN-S
+int dir = 0
+float rrUsed = na
+float entryPx = na
+float slPx = na
+float tpPx = na
+
+if sigLongBreakout
+    tradeType := 1
+    dir := 1
+    rrUsed := rrBreakout
+    entryPx := close
+    slPx := low[1]
+    tpPx := entryPx + rrUsed * (entryPx - slPx)
+else if sigShortBreakout
+    tradeType := 2
+    dir := -1
+    rrUsed := rrBreakout
+    entryPx := close
+    slPx := high[1]
+    tpPx := entryPx - rrUsed * (slPx - entryPx)
+else if sigLongMean
+    tradeType := 3
+    dir := 1
+    rrUsed := rrMean
+    entryPx := close
+    slPx := math.max(bleU[1], blwU[1]) // your rule
+    tpPx := entryPx + rrUsed * (entryPx - slPx)
+else if sigShortMean
+    tradeType := 4
+    dir := -1
+    rrUsed := rrMean
+    entryPx := close
+    slPx := math.min(bheL[1], bhwL[1]) // your rule
+    tpPx := entryPx - rrUsed * (slPx - entryPx)
+
+// Only place trades on confirmed bar close, and only when flat
+bool newSignal = (tradeType != 0) and barstate.isconfirmed
+bool flat = strategy.position_size == 0
+
+// Guard: stop must be on the correct side (otherwise RR & sizing break)
+bool slOk = (dir == 1 and slPx < entryPx) or (dir == -1 and slPx > entryPx)
+
+// Size and send orders
+if newSignal and flat and slOk
+    float qty = f_qtyRisk(entryPx, slPx)
+    if not na(qty) and qty > 0
+        if tradeType == 1
+            strategy.entry("LBO_Long", strategy.long, qty=qty)
+            strategy.exit("LBO_Long_X", from_entry="LBO_Long", stop=slPx, limit=tpPx)
+        else if tradeType == 2
+            strategy.entry("SBO_Short", strategy.short, qty=qty)
+            strategy.exit("SBO_Short_X", from_entry="SBO_Short", stop=slPx, limit=tpPx)
+        else if tradeType == 3
+            strategy.entry("MEAN_Long", strategy.long, qty=qty)
+            strategy.exit("MEAN_Long_X", from_entry="MEAN_Long", stop=slPx, limit=tpPx)
+        else if tradeType == 4
+            strategy.entry("MEAN_Short", strategy.short, qty=qty)
+            strategy.exit("MEAN_Short_X", from_entry="MEAN_Short", stop=slPx, limit=tpPx)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Projected SL/TP lines for the MOST RECENT signal only (visual)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var line slLine = na
+var line tpLine = na
+var label tradeLbl = na
+
+if showTradeLevels and newSignal and slOk and not na(slPx) and not na(tpPx)
+    if not na(slLine)
+        line.delete(slLine)
+    if not na(tpLine)
+        line.delete(tpLine)
+
+    color dirCol = dir == 1 ? color.lime : color.red
+    slLine := line.new(bar_index, slPx, bar_index + 1, slPx, extend=extend.right, color=color.new(dirCol, 0), style=line.style_dashed, width=2)
+    tpLine := line.new(bar_index, tpPx, bar_index + 1, tpPx, extend=extend.right, color=color.new(dirCol, 0), style=line.style_dashed, width=2)
+
+    if showEntryLabel
+        string tag = tradeType == 1 ? "LBO-BO" : tradeType == 2 ? "SBO-BO" : tradeType == 3 ? "MEAN-L" : "MEAN-S"
+        string txt = tag + "\nEntry: " + str.tostring(entryPx, format.mintick) + "\nSL: " + str.tostring(slPx, format.mintick) + "\nTP: " + str.tostring(tpPx, format.mintick) + "\nRR: " + str.tostring(rrUsed, "#.##") + "\nRisk%: " + str.tostring(riskPct, "#.###")
+        if na(tradeLbl)
+            tradeLbl := label.new(bar_index, dir == 1 ? low : high, txt, style=label.style_label_left, textcolor=color.white, color=color.new(dirCol, 0))
+        else
+            label.set_xy(tradeLbl, bar_index, dir == 1 ? low : high)
+            label.set_text(tradeLbl, txt)
+            label.set_color(tradeLbl, color=color.new(dirCol, 0))
+            label.set_textcolor(tradeLbl, color.white)
+
+
+// Alerts (optional)
+alertcondition(sigLongBreakout,  title="ENTRY Long Breakout (LBO)",  message="ENTRY Long Breakout (LBO) on {{ticker}} @ {{close}}")
+alertcondition(sigShortBreakout, title="ENTRY Short Breakout (SBO)", message="ENTRY Short Breakout (SBO) on {{ticker}} @ {{close}}")
+alertcondition(sigLongMean,      title="ENTRY Long Mean",           message="ENTRY Long Mean on {{ticker}} @ {{close}}")
+alertcondition(sigShortMean,     title="ENTRY Short Mean",          message="ENTRY Short Mean on {{ticker}} @ {{close}}")
