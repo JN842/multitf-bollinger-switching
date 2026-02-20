@@ -2,6 +2,7 @@
 Multi-timeframe Bollinger Band switching strategy for crypto backtesting (Python &amp; Pine Script)
 
 CUSTOM BB SWITCHING STRATEGY (LTF 1m + HTF 15m) — ETHUSDT PERP (spot data proxy)
+Backtesting Period: 2024-02-10 to 2026-02-10 (2 Years)
 
 OVERVIEW  
 This repo backtests a Bollinger Band “regime switching” strategy that trades ETHUSDT perpetual using 1-minute execution logic, while using a 15-minute higher timeframe to decide whether the market is in a breakout regime or a mean-reversion regime.
